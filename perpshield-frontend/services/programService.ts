@@ -6,7 +6,6 @@ import {
   PublicKey, 
   Transaction, 
   SystemProgram,
-  LAMPORTS_PER_SOL
 } from '@solana/web3.js';
 import { 
   getAssociatedTokenAddress, 
@@ -18,6 +17,28 @@ import {
 import { PROGRAM_ID, connection, findVaultPDA, findUserStatsPDA, USDC_MINT } from '../lib/solana';
 import idl from '../lib/idl.json';
 
+// ✅ Helper: attach blockhash + feePayer and send via wallet adapter
+async function sendTx(wallet: any, tx: Transaction): Promise<string> {
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = wallet.publicKey;
+
+  // signTransaction is available on wallet adapter
+  const signed = await wallet.signTransaction(tx);
+  const signature = await connection.sendRawTransaction(signed.serialize(), {
+    skipPreflight: false,
+    preflightCommitment: 'confirmed',
+  });
+
+  // ✅ Use modern confirmTransaction with blockhash strategy
+  await connection.confirmTransaction(
+    { signature, blockhash, lastValidBlockHeight },
+    'confirmed'
+  );
+
+  return signature;
+}
+
 export class PerpShieldService {
   private program: Program;
   private provider: AnchorProvider;
@@ -28,12 +49,11 @@ export class PerpShieldService {
     this.provider = new AnchorProvider(
       connection,
       wallet,
-      AnchorProvider.defaultOptions()
+      { commitment: 'confirmed', preflightCommitment: 'confirmed' }
     );
     this.program = new Program(idl as Idl, PROGRAM_ID, this.provider);
   }
 
-  // Get vault state
   async getVault() {
     try {
       const vaultPDA = await findVaultPDA();
@@ -45,23 +65,16 @@ export class PerpShieldService {
     }
   }
 
-  // Get user stats
   async getUserStats(userPubkey: PublicKey) {
     try {
       const userStatsPDA = await findUserStatsPDA(userPubkey);
       const stats = await this.program.account.userStats.fetch(userStatsPDA);
       return stats;
     } catch (e) {
-      return null; // User stats not initialized
+      return null;
     }
   }
 
-  // Get user's vault token account (shares)
-  async getUserVaultTokenAccount(userPubkey: PublicKey, vaultMint: PublicKey) {
-    return await getAssociatedTokenAddress(vaultMint, userPubkey);
-  }
-
-  // Get vault mint address (share token)
   async getVaultMint(): Promise<PublicKey> {
     const vaultPDA = await findVaultPDA();
     const [vaultMint] = await PublicKey.findProgramAddress(
@@ -71,37 +84,24 @@ export class PerpShieldService {
     return vaultMint;
   }
 
-  // Deposit USDC
   async deposit(amount: number) {
     try {
       const vaultPDA = await findVaultPDA();
       const vault = await this.getVault();
-      
-      if (!vault) {
-        throw new Error('Vault not initialized');
-      }
-      
-      // Get or create user's USDC ATA
+      if (!vault) throw new Error('Vault not initialized on-chain');
+
       const userUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, this.wallet.publicKey);
-      
-      // Get vault's USDC ATA
       const vaultUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, vaultPDA, true);
-      
-      // Get vault mint (share token)
       const vaultMint = await this.getVaultMint();
-      
-      // Get user's vault token account
       const userVaultTokenAccount = await getAssociatedTokenAddress(vaultMint, this.wallet.publicKey);
-      
-      // Get or create user stats
       const userStatsPDA = await findUserStatsPDA(this.wallet.publicKey);
-      
-      // Check if user USDC ATA exists, if not create it
+
+      // Ensure user USDC ATA exists
       try {
         await getAccount(connection, userUSDCAccount);
       } catch (e) {
-        // Create ATA
-        const tx = new Transaction().add(
+        console.log('Creating user USDC ATA...');
+        const createAtaTx = new Transaction().add(
           createAssociatedTokenAccountInstruction(
             this.wallet.publicKey,
             userUSDCAccount,
@@ -109,17 +109,13 @@ export class PerpShieldService {
             USDC_MINT
           )
         );
-        const { blockhash } = await connection.getLatestBlockhash();
-        tx.recentBlockhash = blockhash;
-        tx.feePayer = this.wallet.publicKey;
-        
-        const signed = await this.wallet.signTransaction(tx);
-        const signature = await connection.sendRawTransaction(signed.serialize());
-        await connection.confirmTransaction(signature);
+        await sendTx(this.wallet, createAtaTx);
+        console.log('✅ User USDC ATA created');
       }
-      
-      const amountWithDecimals = amount * 1e6; // USDC has 6 decimals
-      
+
+      const amountWithDecimals = Math.floor(amount * 1e6);
+      console.log(`Depositing ${amount} USDC (${amountWithDecimals} raw units)`);
+
       const tx = await this.program.methods
         .deposit(new BN(amountWithDecimals))
         .accounts({
@@ -135,40 +131,36 @@ export class PerpShieldService {
           systemProgram: SystemProgram.programId,
         })
         .transaction();
-      
-      const { blockhash } = await connection.getLatestBlockhash();
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = this.wallet.publicKey;
-      
-      const signed = await this.wallet.signTransaction(tx);
-      const signature = await connection.sendRawTransaction(signed.serialize());
-      await connection.confirmTransaction(signature);
-      
+
+      const signature = await sendTx(this.wallet, tx);
+      console.log('✅ Deposit tx:', signature);
       return signature;
-    } catch (error) {
+    } catch (error: any) {
       console.error('Deposit error:', error);
+      // Expose anchor logs if available
+      if (error.logs) {
+        console.error('Program logs:', error.logs.join('\n'));
+      }
       throw error;
     }
   }
 
-  // Withdraw shares
   async withdraw(shares: number) {
     try {
       const vaultPDA = await findVaultPDA();
       const vault = await this.getVault();
-      
-      if (!vault) {
-        throw new Error('Vault not initialized');
-      }
-      
+      if (!vault) throw new Error('Vault not initialized');
+
       const vaultMint = await this.getVaultMint();
       const userUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, this.wallet.publicKey);
       const vaultUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, vaultPDA, true);
       const userVaultTokenAccount = await getAssociatedTokenAddress(vaultMint, this.wallet.publicKey);
       const userStatsPDA = await findUserStatsPDA(this.wallet.publicKey);
-      
+
+      const sharesRaw = Math.floor(shares * 1e6);
+
       const tx = await this.program.methods
-        .withdraw(new BN(shares))
+        .withdraw(new BN(sharesRaw))
         .accounts({
           vault: vaultPDA,
           user: this.wallet.publicKey,
@@ -181,36 +173,25 @@ export class PerpShieldService {
           systemProgram: SystemProgram.programId,
         })
         .transaction();
-      
-      const { blockhash } = await connection.getLatestBlockhash();
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = this.wallet.publicKey;
-      
-      const signed = await this.wallet.signTransaction(tx);
-      const signature = await connection.sendRawTransaction(signed.serialize());
-      await connection.confirmTransaction(signature);
-      
-      return signature;
-    } catch (error) {
+
+      return await sendTx(this.wallet, tx);
+    } catch (error: any) {
       console.error('Withdraw error:', error);
+      if (error.logs) console.error('Program logs:', error.logs.join('\n'));
       throw error;
     }
   }
 
-  // Harvest funding fees
   async harvest() {
     try {
       const vaultPDA = await findVaultPDA();
       const vault = await this.getVault();
-      
-      if (!vault) {
-        throw new Error('Vault not initialized');
-      }
-      
+      if (!vault) throw new Error('Vault not initialized');
+
       const vaultUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, vaultPDA, true);
       const callerUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, this.wallet.publicKey);
       const userStatsPDA = await findUserStatsPDA(this.wallet.publicKey);
-      
+
       const tx = await this.program.methods
         .harvest()
         .accounts({
@@ -223,27 +204,19 @@ export class PerpShieldService {
           systemProgram: SystemProgram.programId,
         })
         .transaction();
-      
-      const { blockhash } = await connection.getLatestBlockhash();
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = this.wallet.publicKey;
-      
-      const signed = await this.wallet.signTransaction(tx);
-      const signature = await connection.sendRawTransaction(signed.serialize());
-      await connection.confirmTransaction(signature);
-      
-      return signature;
-    } catch (error) {
+
+      return await sendTx(this.wallet, tx);
+    } catch (error: any) {
       console.error('Harvest error:', error);
+      if (error.logs) console.error('Program logs:', error.logs.join('\n'));
       throw error;
     }
   }
 
-  // Update shield score
   async updateShieldScore(fundingMagnitude: number, oracleFreshnessSecs: number, drawdownPercent: number) {
     try {
       const vaultPDA = await findVaultPDA();
-      
+
       const tx = await this.program.methods
         .updateShieldScore(
           new BN(fundingMagnitude),
@@ -255,36 +228,25 @@ export class PerpShieldService {
           systemProgram: SystemProgram.programId,
         })
         .transaction();
-      
-      const { blockhash } = await connection.getLatestBlockhash();
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = this.wallet.publicKey;
-      
-      const signed = await this.wallet.signTransaction(tx);
-      const signature = await connection.sendRawTransaction(signed.serialize());
-      await connection.confirmTransaction(signature);
-      
-      return signature;
-    } catch (error) {
+
+      return await sendTx(this.wallet, tx);
+    } catch (error: any) {
       console.error('Update shield score error:', error);
+      if (error.logs) console.error('Program logs:', error.logs.join('\n'));
       throw error;
     }
   }
 
-  // Emergency deleverage
   async emergencyDeleverage() {
     try {
       const vaultPDA = await findVaultPDA();
       const vault = await this.getVault();
-      
-      if (!vault) {
-        throw new Error('Vault not initialized');
-      }
-      
+      if (!vault) throw new Error('Vault not initialized');
+
       const vaultUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, vaultPDA, true);
       const callerUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, this.wallet.publicKey);
       const userStatsPDA = await findUserStatsPDA(this.wallet.publicKey);
-      
+
       const tx = await this.program.methods
         .emergencyDeleverage()
         .accounts({
@@ -297,18 +259,11 @@ export class PerpShieldService {
           systemProgram: SystemProgram.programId,
         })
         .transaction();
-      
-      const { blockhash } = await connection.getLatestBlockhash();
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = this.wallet.publicKey;
-      
-      const signed = await this.wallet.signTransaction(tx);
-      const signature = await connection.sendRawTransaction(signed.serialize());
-      await connection.confirmTransaction(signature);
-      
-      return signature;
-    } catch (error) {
+
+      return await sendTx(this.wallet, tx);
+    } catch (error: any) {
       console.error('Emergency deleverage error:', error);
+      if (error.logs) console.error('Program logs:', error.logs.join('\n'));
       throw error;
     }
   }

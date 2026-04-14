@@ -16,15 +16,13 @@ import {
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   getAccount,
-  createInitializeMintInstruction,
-  MINT_SIZE,
 } from '@solana/spl-token';
 import { PerpShieldService } from '../services/programService';
 import { PacificaService, PacificaMarketData } from '../services/pacificaService';
 import { connection, USDC_MINT, findVaultPDA, findVaultMintPDA } from '../lib/solana';
 
 export default function PerpShieldDashboard() {
-  const { publicKey, connected, wallet } = useWallet();
+  const { publicKey, connected, wallet, sendTransaction } = useWallet();
   const [service, setService] = useState<PerpShieldService | null>(null);
   const [vault, setVault] = useState<any>(null);
   const [userStats, setUserStats] = useState<any>(null);
@@ -35,11 +33,11 @@ export default function PerpShieldDashboard() {
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [vaultMintInitialized, setVaultMintInitialized] = useState(false);
   const [usdcBalance, setUsdcBalance] = useState(0);
+  const [solBalance, setSolBalance] = useState(0);
   const [pacificaData, setPacificaData] = useState<PacificaMarketData | null>(null);
   const [pacificaService] = useState(() => new PacificaService());
   const [mounted, setMounted] = useState(false);
 
-  // Fix hydration: Only render after mount
   useEffect(() => {
     setMounted(true);
   }, []);
@@ -52,7 +50,6 @@ export default function PerpShieldDashboard() {
       const handleData = (data: PacificaMarketData) => {
         if (data.symbol === 'BTC-PERP' || data.symbol === 'BTC') {
           setPacificaData(data);
-          console.log('📡 Pacifica Real Data:', data);
         }
       };
       
@@ -74,6 +71,7 @@ export default function PerpShieldDashboard() {
       loadUserStats(svc);
       checkVaultMint();
       checkUSDCBalance();
+      checkSolBalance();
     }
   }, [connected, publicKey, wallet, mounted]);
 
@@ -83,16 +81,24 @@ export default function PerpShieldDashboard() {
       const accountInfo = await connection.getAccountInfo(vaultMint);
       const exists = !!accountInfo;
       setVaultMintInitialized(exists);
-      
       if (exists) {
-        console.log("✅ Vault mint already exists:", vaultMint.toString());
-        toast.success("Vault mint already initialized!");
+        console.log("✅ Vault mint exists:", vaultMint.toString());
       } else {
-        console.log("❌ Vault mint not found, need initialization");
+        console.log("ℹ️ Vault mint not found (initialized by program on first deposit)");
       }
     } catch (error) {
       console.error("Error checking vault mint:", error);
       setVaultMintInitialized(false);
+    }
+  };
+
+  const checkSolBalance = async () => {
+    if (!publicKey) return;
+    try {
+      const bal = await connection.getBalance(publicKey);
+      setSolBalance(bal / 1e9);
+    } catch (e) {
+      console.error("Error checking SOL balance:", e);
     }
   };
 
@@ -129,74 +135,17 @@ export default function PerpShieldDashboard() {
     if (!publicKey) return;
     try {
       const stats = await svc.getUserStats(publicKey);
-      if (stats) {
-        setUserStats(stats);
-      }
+      if (stats) setUserStats(stats);
     } catch (error) {
       console.error('Error loading user stats:', error);
     }
   };
 
-  const initializeVaultMint = async () => {
-    if (!publicKey || !wallet) {
-      toast.error('Please connect wallet first');
-      return;
-    }
-    
-    setLoading(true);
-    try {
-      const vaultMint = await findVaultMintPDA();
-      
-      const accountInfo = await connection.getAccountInfo(vaultMint);
-      if (accountInfo) {
-        toast.success('Vault mint already initialized!');
-        setVaultMintInitialized(true);
-        return;
-      }
-      
-      console.log("Creating vault mint:", vaultMint.toString());
-      
-      const mintRent = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
-      const vaultPDA = await findVaultPDA();
-      
-      const createMintIx = SystemProgram.createAccount({
-        fromPubkey: publicKey,
-        newAccountPubkey: vaultMint,
-        lamports: mintRent,
-        space: MINT_SIZE,
-        programId: TOKEN_PROGRAM_ID,
-      });
-      
-      const initMintIx = createInitializeMintInstruction(
-        vaultMint,
-        6,
-        publicKey, // Use wallet as mint authority for now
-        null
-      );
-      
-      const transaction = new Transaction().add(createMintIx, initMintIx);
-      
-      console.log("Sending transaction, please approve in Phantom...");
-      
-      // FIXED: Use sendTransaction instead of signTransaction
-      const signature = await wallet.adapter.sendTransaction(transaction, connection);
-      
-      console.log("Transaction sent, confirming...");
-      await connection.confirmTransaction(signature);
-      
-      toast.success(`Vault mint created successfully! TX: ${signature.slice(0, 8)}...`);
-      setVaultMintInitialized(true);
-      
-    } catch (error: any) {
-      console.error("Init error:", error);
-      toast.error(`Init failed: ${error.message}`);
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // ✅ FIXED: Vault mint is a PDA — initialized by the program on first deposit.
+  // This button is only shown as a helper if vault mint is missing.
+  // The real fix is to just call deposit which creates it via CPI.
   const createUSDCAccount = async () => {
-    if (!publicKey || !wallet) {
+    if (!publicKey || !sendTransaction) {
       toast.error('Please connect wallet first');
       return;
     }
@@ -204,8 +153,6 @@ export default function PerpShieldDashboard() {
     setLoading(true);
     try {
       const userUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, publicKey);
-      
-      // Check if exists
       const accountInfo = await connection.getAccountInfo(userUSDCAccount);
       
       if (accountInfo) {
@@ -224,23 +171,27 @@ export default function PerpShieldDashboard() {
           USDC_MINT
         )
       );
+
+      // ✅ FIXED: Use useWallet's sendTransaction hook (handles blockhash/feePayer internally)
+      const signature = await sendTransaction(transaction, connection);
       
-      // FIXED: Use sendTransaction instead of signTransaction
-      const signature = await wallet.adapter.sendTransaction(transaction, connection);
-      
-      console.log("Transaction sent, confirming...");
-      await connection.confirmTransaction(signature);
+      // ✅ FIXED: Use new confirmTransaction API
+      const latestBlockhash = await connection.getLatestBlockhash();
+      await connection.confirmTransaction({
+        signature,
+        ...latestBlockhash,
+      });
       
       toast.success(`USDC account created! TX: ${signature.slice(0, 8)}...`);
       await checkUSDCBalance();
       
     } catch (error: any) {
       console.error("Create USDC account error:", error);
-      if (!error.message.includes('already in use')) {
-        toast.error(`Failed to create USDC account: ${error.message}`);
-      } else {
+      if (error.message?.includes('already in use')) {
         toast.success('USDC account already exists!');
         await checkUSDCBalance();
+      } else {
+        toast.error(`Failed: ${error.message || 'Unknown error'}`);
       }
     } finally {
       setLoading(false);
@@ -253,19 +204,19 @@ export default function PerpShieldDashboard() {
       return;
     }
     
-    if (!vaultMintInitialized) {
-      toast.error('Please initialize vault mint first!');
-      return;
-    }
-    
     if (usdcBalance === 0) {
       toast.error('You have 0 USDC! Please get test USDC first.');
       return;
     }
     
     const amount = parseFloat(depositAmount);
+    if (isNaN(amount) || amount <= 0) {
+      toast.error('Enter a valid amount');
+      return;
+    }
+    
     if (amount > usdcBalance) {
-      toast.error(`Insufficient USDC balance! You have ${usdcBalance} USDC`);
+      toast.error(`Insufficient USDC! You have ${usdcBalance} USDC`);
       return;
     }
     
@@ -274,12 +225,17 @@ export default function PerpShieldDashboard() {
       const tx = await service.deposit(amount);
       toast.success(`Deposit successful! TX: ${tx.slice(0, 8)}...`);
       setDepositAmount('');
+      // Refresh vault mint status after deposit (program creates it)
+      await checkVaultMint();
       await loadVaultData(service);
       await loadUserStats(service);
       await checkUSDCBalance();
     } catch (error: any) {
       console.error("Deposit error:", error);
+      // Show detailed error
+      const msg = error?.logs?.join('\n') || error?.message || 'Unknown error';
       toast.error(`Deposit failed: ${error.message}`);
+      console.error("Full error logs:", error?.logs);
     } finally {
       setLoading(false);
     }
@@ -340,21 +296,13 @@ export default function PerpShieldDashboard() {
         drawdownPercent = Math.min(100, Math.floor((peakAssets - totalAssets) * 100 / peakAssets));
       }
       
-      console.log('📊 Updating Shield Score with real data:', {
-        fundingMagnitude,
-        oracleFreshnessSecs,
-        drawdownPercent,
-        fundingRate: pacificaData.funding,
-        oraclePrice: pacificaData.oracle
-      });
-      
       const tx = await service.updateShieldScore(
         fundingMagnitude,
         oracleFreshnessSecs,
         drawdownPercent
       );
       
-      toast.success(`✅ Real Pacifica Update! Funding: ${(pacificaData.funding * 100).toFixed(6)}% → Score updated`);
+      toast.success(`✅ Shield Score updated! Funding: ${(pacificaData.funding * 100).toFixed(6)}%`);
       await loadVaultData(service);
     } catch (error: any) {
       console.error("Update error:", error);
@@ -378,10 +326,7 @@ export default function PerpShieldDashboard() {
     }
   };
 
-  // Don't render anything until mounted to avoid hydration mismatch
-  if (!mounted) {
-    return null;
-  }
+  if (!mounted) return null;
 
   if (!connected) {
     return (
@@ -399,6 +344,9 @@ export default function PerpShieldDashboard() {
     );
   }
 
+  const shieldColor = shieldScore >= 70 ? 'text-green-400' : shieldScore >= 40 ? 'text-yellow-400' : 'text-red-400';
+  const shieldBorder = shieldScore >= 70 ? 'border-green-500' : shieldScore >= 40 ? 'border-yellow-500' : 'border-red-500';
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800">
       <Toaster position="top-right" />
@@ -414,22 +362,18 @@ export default function PerpShieldDashboard() {
               </span>
             )}
           </div>
-          <div className="flex gap-2">
-            {!vaultMintInitialized && (
-              <button
-                onClick={initializeVaultMint}
-                disabled={loading}
-                className="px-3 py-1 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm transition disabled:opacity-50"
-              >
-                🏦 Initialize Vault Mint
-              </button>
-            )}
+          <div className="flex items-center gap-2">
+            {/* SOL balance indicator */}
+            <div className="hidden sm:flex items-center gap-1 px-3 py-1 bg-gray-700 rounded-lg">
+              <span className="text-xs text-gray-400">SOL:</span>
+              <span className="text-xs text-white font-mono">{solBalance.toFixed(3)}</span>
+            </div>
             <button
               onClick={createUSDCAccount}
               disabled={loading}
               className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm transition disabled:opacity-50"
             >
-              💰 Create USDC Account
+              💰 Setup USDC Account
             </button>
             <WalletMultiButton />
           </div>
@@ -437,6 +381,21 @@ export default function PerpShieldDashboard() {
       </header>
 
       <main className="container mx-auto px-4 py-8">
+
+        {/* Status Banner */}
+        <div className="mb-6 grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {/* Vault mint status */}
+          <div className={`rounded-xl p-3 border text-center text-sm ${vaultMintInitialized ? 'bg-green-900/30 border-green-500/50 text-green-400' : 'bg-yellow-900/30 border-yellow-500/50 text-yellow-400'}`}>
+            {vaultMintInitialized ? '✅ Vault Mint: Ready' : 'ℹ️ Vault Mint: Created on first deposit'}
+          </div>
+          <div className={`rounded-xl p-3 border text-center text-sm ${usdcBalance > 0 ? 'bg-green-900/30 border-green-500/50 text-green-400' : 'bg-red-900/30 border-red-500/50 text-red-400'}`}>
+            {usdcBalance > 0 ? `✅ USDC Balance: ${usdcBalance.toLocaleString()}` : '❌ No USDC — Setup account first'}
+          </div>
+          <div className={`rounded-xl p-3 border text-center text-sm ${solBalance > 0.1 ? 'bg-green-900/30 border-green-500/50 text-green-400' : 'bg-red-900/30 border-red-500/50 text-red-400'}`}>
+            {solBalance > 0.1 ? `✅ SOL: ${solBalance.toFixed(3)} (enough for fees)` : `⚠️ Low SOL: ${solBalance.toFixed(3)}`}
+          </div>
+        </div>
+
         {/* Pacifica Live Data Card */}
         {pacificaData ? (
           <div className="bg-gradient-to-r from-emerald-900/30 to-teal-900/30 border border-emerald-500/50 rounded-2xl p-5 mb-6 backdrop-blur-sm">
@@ -482,8 +441,8 @@ export default function PerpShieldDashboard() {
           <div className="text-center">
             <h2 className="text-gray-400 text-sm uppercase tracking-wider mb-2">Shield Score</h2>
             <div className="relative inline-block">
-              <div className="w-32 h-32 rounded-full border-8 border-gray-700 flex items-center justify-center">
-                <span className="text-3xl font-bold text-white">{shieldScore}</span>
+              <div className={`w-32 h-32 rounded-full border-8 ${shieldBorder} flex items-center justify-center`}>
+                <span className={`text-3xl font-bold ${shieldColor}`}>{shieldScore}</span>
               </div>
             </div>
             <p className="text-gray-400 mt-2">/100</p>
@@ -546,7 +505,7 @@ export default function PerpShieldDashboard() {
             <div className="mt-3 h-2 bg-gray-700 rounded-full overflow-hidden">
               <div 
                 className="h-full bg-gradient-to-r from-purple-500 to-blue-500 rounded-full"
-                style={{ width: `${(userStats.xp || 0) % 100}%` }}
+                style={{ width: `${(Number(userStats.xp) || 0) % 100}%` }}
               />
             </div>
           </div>
@@ -556,24 +515,41 @@ export default function PerpShieldDashboard() {
         <div className="grid md:grid-cols-2 gap-6 mb-8">
           <div className="bg-gray-800/50 backdrop-blur-sm rounded-xl p-6 border border-gray-700">
             <h3 className="text-xl font-bold text-white mb-4">💰 Deposit USDC</h3>
+            
+            {isPaused && (
+              <div className="mb-3 p-3 bg-red-900/40 border border-red-500/50 rounded-lg">
+                <p className="text-red-400 text-sm">⚠️ Vault is paused. Shield score too low.</p>
+              </div>
+            )}
+            
             <div className="space-y-4">
               <div>
-                <label className="block text-gray-400 text-sm mb-2">Amount (USDC)</label>
+                <label className="block text-gray-400 text-sm mb-2">
+                  Amount (USDC) — Balance: <span className="text-blue-400">{usdcBalance}</span>
+                </label>
                 <input
                   type="number"
                   value={depositAmount}
                   onChange={(e) => setDepositAmount(e.target.value)}
                   placeholder="Enter amount..."
                   className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
-                  disabled={isPaused || !vaultMintInitialized || usdcBalance === 0}
+                  disabled={isPaused || usdcBalance === 0}
                 />
+                {depositAmount && (
+                  <button
+                    onClick={() => setDepositAmount(usdcBalance.toString())}
+                    className="text-xs text-blue-400 mt-1 hover:underline"
+                  >
+                    Use max ({usdcBalance} USDC)
+                  </button>
+                )}
               </div>
               <button
                 onClick={handleDeposit}
-                disabled={loading || isPaused || !vaultMintInitialized || usdcBalance === 0}
+                disabled={loading || isPaused || usdcBalance === 0}
                 className="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-3 rounded-lg transition disabled:opacity-50"
               >
-                {!vaultMintInitialized ? 'Init Vault Mint First' : usdcBalance === 0 ? 'Get USDC First' : loading ? 'Processing...' : 'Deposit'}
+                {usdcBalance === 0 ? '❌ No USDC — Setup account first' : loading ? 'Processing...' : 'Deposit'}
               </button>
             </div>
           </div>
@@ -608,8 +584,10 @@ export default function PerpShieldDashboard() {
             <h3 className="text-xl font-bold text-white mb-4">🎯 Bounty Actions</h3>
             <div className="space-y-3">
               <div className="flex justify-between items-center py-2 border-b border-gray-700">
-                <span className="text-gray-300">Harvest Funding</span>
-                <span className="text-green-400 text-sm">Bounty: {vault?.harvestBounty ? vault.harvestBounty / 100 : 0}%</span>
+                <div>
+                  <span className="text-gray-300 block">Harvest Funding</span>
+                  <span className="text-green-400 text-xs">Bounty: {vault?.harvestBounty ? vault.harvestBounty / 100 : 0}%</span>
+                </div>
                 <button
                   onClick={handleHarvest}
                   disabled={loading}
@@ -619,8 +597,13 @@ export default function PerpShieldDashboard() {
                 </button>
               </div>
               <div className="flex justify-between items-center py-2">
-                <span className="text-gray-300">Emergency Deleverage</span>
-                <span className="text-red-400 text-sm">Bounty: {vault?.deleverageBounty ? vault.deleverageBounty / 100 : 0}%</span>
+                <div>
+                  <span className="text-gray-300 block">Emergency Deleverage</span>
+                  <span className="text-red-400 text-xs">
+                    Bounty: {vault?.deleverageBounty ? vault.deleverageBounty / 100 : 0}% 
+                    {shieldScore > 15 && ' (Score too high)'}
+                  </span>
+                </div>
                 <button
                   onClick={handleEmergencyDeleverage}
                   disabled={loading || shieldScore > 15}
@@ -653,6 +636,12 @@ export default function PerpShieldDashboard() {
                 <span className="text-gray-400">Last Rebalance:</span>
                 <span className="text-white text-sm">
                   {vault?.lastRebalance ? new Date(Number(vault.lastRebalance) * 1000).toLocaleString() : 'N/A'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-400">Vault Mint:</span>
+                <span className={`text-sm ${vaultMintInitialized ? 'text-green-400' : 'text-yellow-400'}`}>
+                  {vaultMintInitialized ? '✅ Initialized' : '⏳ Pending first deposit'}
                 </span>
               </div>
             </div>
