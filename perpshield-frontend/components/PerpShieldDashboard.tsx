@@ -81,9 +81,18 @@ export default function PerpShieldDashboard() {
     try {
       const vaultMint = await findVaultMintPDA();
       const accountInfo = await connection.getAccountInfo(vaultMint);
-      setVaultMintInitialized(!!accountInfo);
+      const exists = !!accountInfo;
+      setVaultMintInitialized(exists);
+      
+      if (exists) {
+        console.log("✅ Vault mint already exists:", vaultMint.toString());
+        toast.success("Vault mint already initialized!");
+      } else {
+        console.log("❌ Vault mint not found, need initialization");
+      }
     } catch (error) {
       console.error("Error checking vault mint:", error);
+      setVaultMintInitialized(false);
     }
   };
 
@@ -148,6 +157,7 @@ export default function PerpShieldDashboard() {
       console.log("Creating vault mint:", vaultMint.toString());
       
       const mintRent = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
+      const vaultPDA = await findVaultPDA();
       
       const createMintIx = SystemProgram.createAccount({
         fromPubkey: publicKey,
@@ -160,17 +170,18 @@ export default function PerpShieldDashboard() {
       const initMintIx = createInitializeMintInstruction(
         vaultMint,
         6,
-        publicKey,
+        publicKey, // Use wallet as mint authority for now
         null
       );
       
       const transaction = new Transaction().add(createMintIx, initMintIx);
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = publicKey;
       
-      const signed = await wallet.adapter.signTransaction(transaction);
-      const signature = await connection.sendRawTransaction(signed.serialize());
+      console.log("Sending transaction, please approve in Phantom...");
+      
+      // FIXED: Use sendTransaction instead of signTransaction
+      const signature = await wallet.adapter.sendTransaction(transaction, connection);
+      
+      console.log("Transaction sent, confirming...");
       await connection.confirmTransaction(signature);
       
       toast.success(`Vault mint created successfully! TX: ${signature.slice(0, 8)}...`);
@@ -194,37 +205,43 @@ export default function PerpShieldDashboard() {
     try {
       const userUSDCAccount = await getAssociatedTokenAddress(USDC_MINT, publicKey);
       
-      try {
-        const account = await getAccount(connection, userUSDCAccount);
+      // Check if exists
+      const accountInfo = await connection.getAccountInfo(userUSDCAccount);
+      
+      if (accountInfo) {
         toast.success('USDC account already exists!');
         await checkUSDCBalance();
         return;
-      } catch (e) {
-        console.log("Creating USDC token account...");
-        
-        const transaction = new Transaction().add(
-          createAssociatedTokenAccountInstruction(
-            publicKey,
-            userUSDCAccount,
-            publicKey,
-            USDC_MINT
-          )
-        );
-        
-        const { blockhash } = await connection.getLatestBlockhash();
-        transaction.recentBlockhash = blockhash;
-        transaction.feePayer = publicKey;
-        
-        const signed = await wallet.adapter.signTransaction(transaction);
-        const signature = await connection.sendRawTransaction(signed.serialize());
-        await connection.confirmTransaction(signature);
-        
-        toast.success(`USDC account created! TX: ${signature.slice(0, 8)}...`);
-        await checkUSDCBalance();
       }
+      
+      console.log("Creating USDC token account...");
+      
+      const transaction = new Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          publicKey,
+          userUSDCAccount,
+          publicKey,
+          USDC_MINT
+        )
+      );
+      
+      // FIXED: Use sendTransaction instead of signTransaction
+      const signature = await wallet.adapter.sendTransaction(transaction, connection);
+      
+      console.log("Transaction sent, confirming...");
+      await connection.confirmTransaction(signature);
+      
+      toast.success(`USDC account created! TX: ${signature.slice(0, 8)}...`);
+      await checkUSDCBalance();
+      
     } catch (error: any) {
       console.error("Create USDC account error:", error);
-      toast.error(`Failed to create USDC account: ${error.message}`);
+      if (!error.message.includes('already in use')) {
+        toast.error(`Failed to create USDC account: ${error.message}`);
+      } else {
+        toast.success('USDC account already exists!');
+        await checkUSDCBalance();
+      }
     } finally {
       setLoading(false);
     }
