@@ -8,17 +8,6 @@ export interface PacificaMarketData {
   timestamp: number;
 }
 
-export interface PacificaTicker {
-  symbol: string;
-  lastPrice: string;
-  markPrice: string;
-  indexPrice: string;
-  fundingRate: string;
-  nextFundingTime: number;
-  openInterest: string;
-  volume24h: string;
-}
-
 export class PacificaService {
   private listeners: ((data: PacificaMarketData) => void)[] = [];
   private interval: NodeJS.Timeout | null = null;
@@ -42,36 +31,94 @@ export class PacificaService {
 
   private async fetchMarketData() {
     try {
-      // Fetch ticker for BTC perp
-      const response = await fetch(`${this.API_URL}/ticker?symbol=BTC-PERP`);
+      // Pacifica public endpoints (no API key needed)
+      // Try multiple endpoints that might work
       
-      if (!response.ok) {
-        throw new Error(`API error: ${response.status}`);
+      let marketData: PacificaMarketData | null = null;
+      
+      // Try 1: Get all markets first
+      try {
+        const marketsResponse = await fetch(`${this.API_URL}/markets`);
+        if (marketsResponse.ok) {
+          const markets = await marketsResponse.json();
+          const btcMarket = markets.find((m: any) => m.symbol === 'BTC-PERP' || m.symbol === 'BTC');
+          if (btcMarket) {
+            marketData = {
+              symbol: 'BTC-PERP',
+              funding: parseFloat(btcMarket.fundingRate || btcMarket.funding || '0'),
+              oracle: parseFloat(btcMarket.indexPrice || btcMarket.oracle || btcMarket.markPrice || '65000'),
+              mark: parseFloat(btcMarket.markPrice || btcMarket.mark || '65000'),
+              timestamp: Date.now()
+            };
+            console.log('✅ Got Pacifica data from /markets endpoint');
+          }
+        }
+      } catch (e) {
+        console.log('⚠️ /markets endpoint failed');
       }
       
-      const data = await response.json();
+      // Try 2: Direct ticker endpoint
+      if (!marketData) {
+        try {
+          const tickerResponse = await fetch(`${this.API_URL}/ticker?symbol=BTC-PERP`);
+          if (tickerResponse.ok) {
+            const ticker = await tickerResponse.json();
+            marketData = {
+              symbol: 'BTC-PERP',
+              funding: parseFloat(ticker.fundingRate || ticker.funding || '0'),
+              oracle: parseFloat(ticker.indexPrice || ticker.oracle || ticker.markPrice || '65000'),
+              mark: parseFloat(ticker.markPrice || ticker.mark || '65000'),
+              timestamp: Date.now()
+            };
+            console.log('✅ Got Pacifica data from /ticker endpoint');
+          }
+        } catch (e) {
+          console.log('⚠️ /ticker endpoint failed');
+        }
+      }
       
-      // Parse the response
-      const marketData: PacificaMarketData = {
-        symbol: 'BTC-PERP',
-        funding: parseFloat(data.fundingRate || '0'),
-        oracle: parseFloat(data.indexPrice || data.markPrice || '65000'),
-        mark: parseFloat(data.markPrice || '65000'),
-        timestamp: Date.now()
-      };
+      // Try 3: Public market data endpoint (no auth)
+      if (!marketData) {
+        try {
+          const publicResponse = await fetch(`${this.API_URL}/public/markets/BTC-PERP`);
+          if (publicResponse.ok) {
+            const data = await publicResponse.json();
+            marketData = {
+              symbol: 'BTC-PERP',
+              funding: parseFloat(data.funding_rate || data.funding || '0'),
+              oracle: parseFloat(data.oracle_price || data.index_price || '65000'),
+              mark: parseFloat(data.mark_price || '65000'),
+              timestamp: Date.now()
+            };
+            console.log('✅ Got Pacifica data from /public/markets endpoint');
+          }
+        } catch (e) {
+          console.log('⚠️ /public/markets endpoint failed');
+        }
+      }
       
-      console.log('📡 Pacifica Real Data:', {
-        funding: marketData.funding,
-        oracle: marketData.oracle,
-        mark: marketData.mark
-      });
-      
-      // Notify all listeners
-      this.listeners.forEach(listener => listener(marketData));
+      if (marketData) {
+        console.log('📡 Pacifica Real Data:', {
+          funding: (marketData.funding * 100).toFixed(6) + '%',
+          oracle: '$' + marketData.oracle.toFixed(0),
+          mark: '$' + marketData.mark.toFixed(0)
+        });
+        this.listeners.forEach(listener => listener(marketData));
+      } else {
+        // If all endpoints fail, use fallback with note
+        console.warn('⚠️ Could not fetch from Pacifica API, using simulated data');
+        const simulatedData: PacificaMarketData = {
+          symbol: 'BTC-PERP',
+          funding: 0.0000125,
+          oracle: 65000 + (Math.random() - 0.5) * 500,
+          mark: 65000 + (Math.random() - 0.5) * 300,
+          timestamp: Date.now()
+        };
+        this.listeners.forEach(listener => listener(simulatedData));
+      }
       
     } catch (error) {
       console.error('❌ Failed to fetch Pacifica data:', error);
-      // Send fallback data to keep UI responsive
       const fallbackData: PacificaMarketData = {
         symbol: 'BTC-PERP',
         funding: 0.0000125,
@@ -98,46 +145,9 @@ export class PacificaService {
   }
 
   calculateFundingMagnitude(fundingRate: number): number {
-    // Convert funding rate to 0-100 scale
-    // Pacifica funding rates are typically small (e.g., 0.0000125 = 0.00125%)
     const absFunding = Math.abs(fundingRate);
-    // Scale: 0.0001 (0.01%) = 100, 0.00005 = 50, etc.
     let magnitude = Math.floor(absFunding * 1000000);
     magnitude = Math.min(100, Math.max(0, magnitude));
     return magnitude;
-  }
-
-  // Additional API methods for hackathon features
-  async getMarketData(symbol: string = 'BTC-PERP'): Promise<PacificaTicker | null> {
-    try {
-      const response = await fetch(`${this.API_URL}/ticker?symbol=${symbol}`);
-      if (!response.ok) return null;
-      return await response.json();
-    } catch (error) {
-      console.error('Error fetching market data:', error);
-      return null;
-    }
-  }
-
-  async getFundingHistory(symbol: string = 'BTC-PERP', limit: number = 10) {
-    try {
-      const response = await fetch(`${this.API_URL}/funding/history?symbol=${symbol}&limit=${limit}`);
-      if (!response.ok) return null;
-      return await response.json();
-    } catch (error) {
-      console.error('Error fetching funding history:', error);
-      return null;
-    }
-  }
-
-  async getOpenInterest(symbol: string = 'BTC-PERP') {
-    try {
-      const response = await fetch(`${this.API_URL}/open-interest?symbol=${symbol}`);
-      if (!response.ok) return null;
-      return await response.json();
-    } catch (error) {
-      console.error('Error fetching open interest:', error);
-      return null;
-    }
   }
 }
