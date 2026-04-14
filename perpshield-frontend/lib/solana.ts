@@ -4,10 +4,12 @@ import idl from './idl.json';
 
 // Your deployed program ID
 export const PROGRAM_ID = new PublicKey('FoQZVguRJUchiQZba72Z1RzSaD7NWTvnAj8V3NahYvFo');
-export const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'); // Devnet USDC
+
+// Devnet USDC mint (this is the official Solana devnet USDC)
+export const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 
 // Devnet connection
-export const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
+export const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 
 // PDA Seeds
 export const findVaultPDA = async () => {
@@ -21,6 +23,15 @@ export const findVaultPDA = async () => {
 export const findUserStatsPDA = async (userPubkey: PublicKey) => {
   const [pda] = await PublicKey.findProgramAddress(
     [Buffer.from('user'), userPubkey.toBuffer()],
+    PROGRAM_ID
+  );
+  return pda;
+};
+
+export const findVaultMintPDA = async () => {
+  const vaultPDA = await findVaultPDA();
+  const [pda] = await PublicKey.findProgramAddress(
+    [Buffer.from('vault_mint'), vaultPDA.toBuffer()],
     PROGRAM_ID
   );
   return pda;
